@@ -1,0 +1,1875 @@
+/* PROGRAM: SIM_FINAL.GAU. Authors: Pierre-Olivier Gourinchas and Jonathan Parker
+** with the help of Grigory Kosenok
+** This program implements the second stage estimation procedure described in Gourinchas and Parker (1999).
+** The program consists of 3 blocs.
+**	BLOC 1: sets global parameters and loads data and shocks
+**	BLOC 2: core of the program
+**	BLOC 3: library of procedures and subroutines
+**
+** The following note describes each element in turn
+**	BLOC 1: global parameters and data
+** STRING GLOBAL VARIABLES:
+**	pathdata	: string for path of data files. You need to set your own path there.
+**	pathres		: string for path for results files. You need to set your own path there.
+**	pathprog	: string for path for program files. You need to set your own path there.
+**	intc		: string suffix for initial data buffer containing intermediate results
+**	outc		: string suffix for final data buffer containing intermediate results
+**	opwtc		: string suffix for matrix with optimal weights
+**	shtc		: string suffix for matrix with earnings shocks
+**	swtc		: string suffix for matrix with initial wealth shocks
+** GLOBALS, TRACKERS AND PARAMETERS:
+**	TRACKERS:
+**	_cont	: continuation global. If 0 creates earnings shocks, 1 loads previous matrices (shtc).
+**	_trac	: tracking global. 0 creates data buffer, 1 loads previous data buffer (intc)
+**	_app	: append global. 1 appends to previous data buffer (may save under a
+**		different name). 0 saves in a different data buffer (that may have the same name).
+**	_contx	: continuation global for wealth shocks. 0 creates wealth shocks for w0;
+**		1 loads previous data (swtc)
+**	_savt	: dummy for saving data buffer: 1 saves
+**	OPTIMIZATION:
+**	_gr	: grid global. 1 evaluates the objective function on a grid
+**	_op	: Optimization global. 1 if optimizes objective function, 0 if loads previous run
+**	_diff	: difference global. 0 estimates in levels, 1 in differences
+**	_test	: if 1 evaluates the objective function.
+**	_diag	: if 1 runs diagnostic on the program
+**	_fam	: if 1 corrects for family size
+**	_ccdold	: if 1 if uses OLD ccd routine (more robust, but much slower)
+**	_scale	: if 1 scales the income and family polynomials
+**	_shx	: if 1, uses shocks to initial wealth
+**	_psho	: 1 if probability of a transitory 0 income shock is > 0.
+**	__output: no screen output when 0.
+**	_id	: profiles global: 1 saves all profiles in the databuffer
+** 	Gradient and VC globals:
+**	_var	: variance global: 1 if computes var-covariance matrix
+**	_var2	: if 1, Variance Covariance correction for second stage
+**	_ser	: if 1 computes robust standard errors
+**	_opw	: if 1, uses optimal weights 
+**	opw2	: if 1, uses optimal weights for second stage correction
+**	_parm	: 20x1 vector. indicator vector for the parameters to estimate in the second stage.
+**		this is a very important vector. Changes in _parm indicate 
+**		to the program which parameters should be estimated.
+**		the order is the following:
+**		Beta, Rho, x0, Gam0, Gam1, _p, _rr, vt, vp, polY1-polY5,polYc,polF1,polF5
+**		where polY1-Y5,polYc are the parameter of the 5-th order polynomial in income
+**		and polF1-polF5 are the parameters of the family adjustment polynomial.
+**		NOTE: the first stage parameters are not estimated in this program.
+**	_parv	: 20x1 vector of the parameters to be included in the second stage correction.
+**		This parameter allows to vary the extent to which second stage correction controls for 
+**		first stage VCV. The order of the variable is the same as _parm.
+**	MODEL PARAMETERS:
+**	_NR	: numbers of simulations read at a time from the datafile.
+**	_NX	: order of the approximation for the Chebyshev procedure
+**	_NI	: order of the Chebyshev integration
+**	_Xmax	: maximum value for cash on hand
+**	_Xmin	: minimum value for cash on hand
+**	_Xint	: intermediate value for cash on hand. 
+**		Used to better control the concavity over xmin-xint
+**	_Nmax	: number of points on the grid
+**	_Nint	: number of points on xmin-xint
+**	_nlstol	: tolerance of NLSYS
+**	_ct	: counter. How many iterations
+**	_TR	: Number of periods in working life
+**	_NN	: number of simulations for profiles construction
+**	GRID PARAMETERS:
+**	_BetMin	: mininum beta for grid search
+**	_BetMax : maximum beta for grid search
+**	_R0Min	: minimum rho for grid search
+**	_R0Max	: maximum who for grid search
+**	_NBet	: number of points on beta grid
+**	_NR0	: number of points on R0 grid
+**	LOADING DATA FROM FIRST STAGE
+**	_c	: _TRx1 vector of average consumption
+**	_y	: _TRx1 expected permanent income
+**	age	: _trx1 vector for age
+**	_cc	: individual consumption observation by age.
+**	gam1	: MPC of consumption rule at retirement (c = gam0+gam1 x)
+**	gam0	: baseline consumption at retirement
+**	g	: growth rate of expected permanent income
+**	vt0	: variance of the transitory shocks to income
+**	vp0	: variance of the permanent shocks to income
+**	_rr	: real interest rate
+**	_p	: probability of 0 income
+**	polY	: 6x1 vector of coefficients on smooth income polynomial
+**	VM	: 20x20 VCV matrix of coefficients described in parm
+**	_X0	: mean assets at the beginning of life
+**	_sw	: standard deviation of log initial wealth
+**	_polF	: 5x1 vector for family size polynomial
+**	_f0	: _trx1 family size shifter.
+**	_W1	: _tr x _tr optimal weights, first stage, level
+**	_W2	: (_tr-1) x (_tr-1) optimal weights, first stage, first difference
+**	taui	: 1/average # profile replications (1/tau)
+**
+** BLOC 2: CORE PROGRAM
+**	1. Calls Gauss-Hermite quadrature routine for nodes and weights.
+**	2. Constructs Cash on Hand Grid over 0-Xmax.
+**	3. Creates and Saves the earnings shocks if not created before (_cont==0)
+**	4. Creates and Saves the wealth shocks if not created before (_contw==0)
+**	5. relabels global parameters for safety
+**	6. creates tracking variables for variables of interest. generic name is vartrac.
+**	7. initializes buffer collecting results and loads initial buffer if necessary
+**		(depends upon values of _app, _sav, _trac
+**	8. loads initial parameters into variable PAR, 20x1 vector and transforms so as to satisfy
+**		constraints (0<beta<1, rho>0....)
+**	9. extracts relevant parameters to estimate into ParSel.
+**	10. saves results so far
+**	11. calls diagnostic tests, grid if necessary
+**	12. starts optimization (if _op==1) as minimization of DistBR routine.
+**	13. recovers the correct parameters
+**	14. computes variance covariance (without control for first stage) by numerical gradient.
+**	15. computes VCV correcting for first stage estimation
+**
+** BLOC 3: PROCEDURES
+**	PARAMETER CONVERSION:
+**	FormPar		: transforms Par vector of parameters to impose nonnegativity and 0<beta<1
+**	FormInvPar	: inverse transformation of FormPar
+**	FillPar		: fills the optimized parameters inside Par
+**	MARGINAL UTILITY
+**	dU		: marginal utility. Uses first order approximation for c close to 0.
+**	DU1		: similar to DU with different threshold for approximation.
+**	Gaus Hermite Quadrature
+**	gauher		: computes nodes and weights of Gauss-Hermite quadrature
+**	Integ1		: returns the integrand of DU next period when next period income = 0 (simple integral)
+**	Integ2		: returns the integrand of DU next period when next period income /= 0 (double integral)
+**	Euler euquation procedure
+**	_euler_1	: computes the residual from the Euler equation at given x and c.
+**	_euler_0	: computes the residual from the Euler equation at given x and c, no 0 income shock.
+**	_euler_last	: residual from Euler equation, last working period.
+**	Euler_1		: estimates euler equation, general case. Passes argument to _euler_1
+**	Euler_0		: estimates euler equation, no 0 income shock case. Passes argument to _euler_0
+**	EUler_last	:  estimates euler equation, last working period. Passes argument to _euler_last
+**	NLSYS2		: root finder, applied to Euler_0,1,last as needed. 
+**			Checks first for binding liquidity constraint
+**	ccd		: fast interpolation/extrapolation routine for consumption(cash on hand)
+**	ccd_old		: old routine for interpolation/extrapolation. More robust but slower.
+**	Algorithm procedures:
+**	rule		: computes all the consumption rules starting from the last working period and 
+**			working backwards
+**	sim		: taking the c-rules from procedure rule, simulates consumers over the life cycle and
+**			constructs profiles.
+**	_dist2		: calculates the distance between the average consumption and the simlated profiles
+**	DistBR		: returns the level or difference distance by calling _dist2
+**	_MomPar		: constructs the vector of moments needed for first stage correction and VCV calculations
+**	GridBR		: grid procedure. Calls DistBTR repeatedly over points on the grid.
+**	Gradient and VCV Procedures:
+**	Om1		: Computes the Omega matrix of weights using only data. This is a diagonal matrix.
+**	Var1b		: Computes the VCV matrix for secodn stage estimation without correction
+**	Var2		: COmputes hte VCV matrix for ParSel correcting for first stage estimation.
+**	BookKeeping:
+**	SavTRac		: saves the data buffer and iterations to disk.
+**
+** The program works with the following GAUSS modules: OPTMUM (optimization), NLSYS (root finder)
+**
+*/
+
+
+@-----------------------------------------------------------------------@
+@-----------------------------------------------------------------------@
+@                           BLOC 1: GLOBALS and DATA			@
+@-----------------------------------------------------------------------@
+@-----------------------------------------------------------------------@
+
+
+LIBRARY pgraph,nlsys,optmum;
+nlset; optset;
+
+
+/* path for directory access */
+pathdata = "d:\\pog\\buffer\\prof-las\\";
+pathres  = "d:\\pog\\buffer\\";
+pathprog = "d:\\pog\\buffer\\";
+
+
+/* string for file names */
+intc	 = "init";	/* suffix for in-tracking buffer	*/
+outc	 = "final";	/* suffix for out-tracking buffer 	*/
+opwtc	 = "weight";	/* matrix with optimal weights		*/
+shtc	 = "shock";	/* name of matrix with earnings shocks	*/
+swtc	 = "wealth";	/* name of matrix with wealth shocks	*/
+
+
+@-----------------------------------------------------------------------@
+@                               Declarations                            @
+@-----------------------------------------------------------------------@
+
+CLEAR _y,_c,_gg,_gam0,_gam1,_vt0,_vp0,_rr,_p;	/* Globals Holding Data */
+CLEAR _xg,_xc,_wg,_ti;                  	/* Hermite Quad Globals */
+CLEAR _x,_ci,_tci,_g,_bet,_Beta,_R0;    	/* Euler Globals 	*/
+CLEAR _st,_sp,_cf,_ct;
+CLEAR _u,_n,_v,_xxm,_cm,_xm;            	/* Simulation Globals 	*/
+CLEAR btrac,r0trac,dtrac,drtrac,xmtrac,ctrac,tctrac; /* Tracking Globals */
+CLEAR x0trac,gamtrac,ptrac;
+CLEAR trac_f,trac_nf;
+CLEAR _mn, _mu, _mn1, _mu1,_eps,_ser,_cc;
+CLEAR _ParI,_parm2;
+CLEAR _cs;
+CLEAR _ind,_cci,_Win;
+CLEAR _Om1,_Om2,_W1,_W2;			/* matrices for optimal weighting	*/
+CLEAR _f0,_f,_c1,_i;
+CLEAR _age,_poly,_polF,_ageP,_scy,_scf,_sw,_w;
+
+@-----------------------------------------------------------------------@
+@                               Parameters                              @
+@-----------------------------------------------------------------------@
+
+/* Customizing Globals */
+
+_cont	= 0;	/* continuation global. If 0 creates shocks, 1 loads prev  */
+_trac	= 0;	/* tracking global: If 0 creates tracking, 1 loads prev run*/
+_app	= 0;	/* appends to previous tracking variable (may save under a
+		different name)*/
+_contx	= 0;	/* if 0 creates shocks for w0, if 1 loads previous	*/
+
+_psho	= 1;	/* p-prob global: 0 if p=0			*/
+_gr	= 0;	/* 1 if grid 					*/
+_op	= 1; 	/* 1 if optimization, 0 if loads previous run	*/
+_diff	= 0;	/* objective global: 0 estimates in levels, 1 in differences*/
+_savt	= 1;	/* dummy for saving tracking: 1 saves 		*/
+_test	= 0;	/* tests the routine 				*/
+_diag	= 0;	/* 1 if diagnostic the program			*/
+_fam	= 1;	/* 1 if corrects for family size			*/
+_ccdold = 0;	/* 1 if uses OLD ccd routine			*/
+_scale	= 1;	/* 1 if scales the income and family polynomials	*/
+_shx	= 1;	/* 1 if shocks to initial wealth			*/
+
+/* vector of parameters to estimate. Takes the following form:		*/
+/* Beta|Rho|x0|gamma0|gamma1|p|R|vt|vp|polY|polF				*/
+_parm	= ONES(20,1);
+_parm[1]= 1;	/* Beta */
+_parm[2]= 1;	/* Rho	*/
+_parm[3]= 1;	/* x0	*/
+_parm[4]= 1;	/* Gam0	*/
+_parm[5]= 1;	/* Gam1	*/
+_parm[6]= 0;	/* _p	*/
+_parm[7]= 0;	/* _rr	*/
+_parm[8]= 0;	/* vt	*/
+_parm[9]= 0;	/* vp	*/
+_parm[10]= 0;	/* polY1*/
+_parm[11]= 0;	/* polY2*/
+_parm[12]= 0;	/* polY3*/
+_parm[13]= 0;	/* polY4*/
+_parm[14]= 0;	/* polY5*/
+_parm[15]= 0;	/* polYc*/
+_parm[16]= 0;	/* polF1*/
+_parm[17]= 0;	/* polF2*/
+_parm[18]= 0;	/* polF3*/
+_parm[19]= 0;	/* polF4*/
+_parm[20]= 0;	/* polF5*/
+
+
+_NR	= 5000;	/* numbers of simulations read at a time */
+_NX	= 30;	/* order of the approximation for the Chebyshev proc */
+_NI	= 12;	/* order of the integration 		*/
+_X0	= 0.3;	/* assets at the beginning of life 	*/
+
+
+/* Euler equation globals */
+_Nmax = 100;	/* number of points on the grid		*/
+_Nint = 50;		/* number of points inter 		*/
+_Xmax = 40;		/* range parameter for x: xmin-xmax 	*/
+_Xmin = 0;
+_Xint = 2;		/* intermediate value for concavity in c*/
+
+/* OPTMUM/NLSYS GLOBALS */
+_nlstol = 0;
+__output= 0;
+
+/* optimization/simulation globals */
+_ct	= 1;		/* counter. How many iterations		*/
+_TR	= 40;		/* Number of periods in working life	*/
+_NN	= 20000;	/* number of simulations for profiles	*/
+_BetMin = 0.80;		/* min beta for grid search		*/
+_BetMax = 0.95;		/* max beta for grid search 		*/
+_R0Min 	= 0.4;		/* min R0 for grid search 		*/
+_R0Max 	= 8;		/* max R0 for grid search 		*/
+_NBet	= 10;		/* # points on beta grid 		*/
+_NR0 	= 10;		/* # points on R0 grid 			*/
+
+_id	= 0;		/* profiles global: 1 saves all profiles in sim	*/
+
+/* Gradient and VC globals */
+_var	= 0;	/* variance global: 1 if computes var-cov		*/
+_var2	= 0;	/* VC correction for second stage			*/
+_ser 	= 0;	/* robust matrix global: 1 is robust std errors */
+_opw	= 1;	/* optimal weights global: 1 if weights non zero*/
+_opw2	= 0;	/* 1 if optimal weights for second stage correction */
+
+
+_parv	= ONES(20,1); /* to be included in second step correction	*/
+_parv[1]= 1;		/* Beta	*/
+_parv[2]= 1;		/* Rho	*/
+_parv[3]= 1;		/* x0	*/
+_parv[4]= 1;		/* _gam0*/
+_parv[5]= 1;		/* _gam1*/
+_parv[6]= 1*_psho;	/* _p	*/
+_parv[7]= 1;		/* _rr	*/
+_parv[8]= 1;		/* vt	*/
+_parv[9]= 1;		/* vp	*/
+_parv[10]= 0;		/* polY1*/
+_parv[11]= 0;		/* polY2*/
+_parv[12]= 0;		/* polY3*/
+_parv[13]= 0;		/* polY4*/
+_parv[14]= 0;		/* polY5*/
+_parv[15]= 0;		/* polYc*/
+_parv[16]= 0;		/* polF1*/
+_parv[17]= 0;		/* polF2*/
+_parv[18]= 0;		/* polF3*/
+_parv[19]= 0;		/* polF4*/
+_parv[20]= 0;		/* polF4*/
+
+
+
+/* Variable Names */
+_wnam = pathres$+"_w"$+swtc$+".fmt";	/* names of gauss matrices for shocks		*/
+_unam = pathres$+"_u"$+shtc$+".fmt";	/* names of gauss matrices for shocks		*/
+_vnam = pathres$+"_v"$+shtc$+".fmt";
+_nnam = pathres$+"_n"$+shtc$+".fmt";
+_csn  = "_csn"$+outc;
+_ysn  = "_ysn"$+outc;
+_ypn  = "_ypn"$+outc;
+_xsn  = "_xsn"$+outc;
+
+
+
+@-----------------------------------------------------------------------@
+@                           Setting up the data                         @
+@-----------------------------------------------------------------------@
+
+	/* sets-up coefficients, together with var-cov for first type	*/
+	/* parms: Beta|Rho|x0|gamma0|gamma1|p|R|vt|vp|poly[1:5]|cst|polF[1:5]	*/
+	VM = ZEROS(20,20);
+
+	/* opening original files with profiles */
+	file1	= pathdata$+"lcbsp23"; /* You need to set your own file name here */
+	OPEN f1	= ^file1;
+	xx1	= READR(f1,rowsf(f1));
+	CLOSE(f1);
+
+	/* actual c-observations */
+	file2	= pathdata$+"lcbsp26"; /* You need to set your own file name here */
+	OPEN f2	= ^file2;
+	_cc	= READR(f2,rowsf(f2));
+	CLOSE(f2);
+
+	age	= xx1[.,2];
+	_c	= xx1[.,3];
+	_y	= xx1[.,4];
+	t	= ROWS(age);
+
+	/* income polynomial (order 5 (1 to 5) and constant)	*/
+	LET polY = .3264338 -.0148947 0.000363424 -4.411685e-06 2.056916e-08 6.8013936;
+
+	LET VM3 = 0.170573 -0.007775 0.000356 0.000172 -7.9e-6 1.8e-7 -1.9e-6
+		  8.5e-8 -1.9e-9 2.1e-11 7.8e-9 -3.6e-10 8.0e-12 -8.8e-14 3.7e-16
+		  -1.45333 0.066031 -0.001458 0.000016 -6.6e-8 12.4255;
+	VM3	= XPND(VM3);
+	if _scale==1; /* if rescale the income and family polynomials */
+		LET _scy= 1	100	1000	1.00E+06 1.00E+08  1;
+		polY	= poly.*_scy;
+		VM3	= _scy.*VM3.*_scy';
+	endif;
+
+	VM[10:15,10:15] = VM3;
+
+	_age0	= SEQA(26,1,41); /* note: goes to 41 to include growth rate age 65-66 */
+	_agep   = {};
+	i = 1; DO WHILE i LE 5;
+		_agep = _agep~(_age0^i);
+	i = i+1; ENDO;
+	_agep	= _agep~ONES(ROWS(_agep),1);
+	if _scale == 1;
+	_y	= exp(_agep*(polY./_scy));
+	else;
+	_y	= exp(_agep*polY);
+	endif;
+	CLEAR xx1;
+
+	/* sets up the gamma coefficient*/
+	_rr	= 1.03440;
+	_p	= 0.00302;
+	gam0	= 0.59414;
+	gam1	= 0.07743;
+	LET VM1 = 0.014709 -0.002065 0.003292;
+	VM1	= XPND(VM1);
+	VM[4 5, 4 5]= VM1; 		/* gam0, gam1 */
+	VM[6,6]	= 0.00076;	/* p */
+	VM[7,7]	= 0.0000281;	/* r */
+
+
+	/* set up the variance components of income */
+	/* source: Carroll and Samwick [94]         */
+	/* st is the var, not the std deviation     */
+	/* transitory component */
+	vt0	= 0.0440;
+	/* permanent component */
+	vp0	= 0.0212;
+	/* sub-block for vp,ct */
+	LET VM2 = 0.0000086501 -0.0000132154 0.0000300973;
+	VM2	= XPND(VM2);
+	/* reshape */
+	VM2	= VM2[2 1, 2 1];
+	VM[8 9,8 9] = VM2;
+		
+
+	/* set-up the expected income growth */
+	/* g has 40 rows and 12 columns. first obs is growth rate age 26-27, last is age 65-66*/
+	g	= _y./MISS(SHIFTR(_y',1,-999)',-999);
+	g	= g[2:rows(_y),.];
+
+
+	/* loads the initial wealth level */
+	file5	= pathdata$+"parmsxb";
+	OPEN f5	= ^file5;
+	xx5	= READR(f5,rowsf(f5));
+	close(f5);
+	_x0	= exp(xx5[1,1]);
+	_sw	= xx5[1,2];
+	/* this needs to be corrected */
+	VM[3,3]	= xx5[1,2]^2;
+
+
+	/* loads the parameters for Family size */
+	file4	= pathdata$+"parmsf2b";
+	OPEN f4	= ^file4;
+	xx4	= READR(f4,rowsf(f4));
+	close(f4);
+	xx4 	= xx4[.,cols(xx4)];
+
+	_polF	= xx4[1:5];
+	_f0	= _agep[.,1:5]*_polF[1:5];
+	_f0	= EXP(_f0-LAG(_f0));
+	_f0	= _f0[2:41];
+
+	/* variance-covariance for the Family adjustment parameters */
+	VM4	= xx4[6:20];
+	VM4	= XPND(VM4);
+
+	if _scale == 1; /* if rescale the income and family polynomials */
+		LET _scf	= 10 100 10000 1.00E+06 1.00E+08;
+		_polF		= _polF[1:5].*_scf;
+		VM4		= _scF.*VM4.*_scf';
+	endif;
+
+	VM[16:20,16:20] = VM4;
+
+
+	/* correction for growth rate of permanent income at age of retirement */
+	IF _fam == 1;
+		g[_TR]= 1/_f0[_tr];
+	ELSE;
+		g[_TR]= 1;
+	ENDIF;
+
+	/* constructing the weighting matrix for first stage	*/
+	/* calculates the weights and number of observations	*/
+	{_Om1,_Om2,ItM}	= Om1(_cc);
+	if _opw2 == 0;
+		_W1	= INVPD(_Om1);	/* optimal weights, first stage, level	*/
+		_W2	= INVPD(_Om2);	/* optimal weights, first stage, first diff*/
+	elseif _opw2 == 1;
+		trac_w	= "TRAC_"$+opwtc;
+		loadm path=^pathres topt=^trac_w;
+		_W1	= vread(topt,"_Wout");
+		_W2	= vread(topt,"_Wout");
+		_W2	= _W2[1:_Tr-1,1:_tr-1];
+		clear topt;
+	endif;
+	taui	= Itm/_NN;		/* 1/average # pf replications (1/tau)	*/
+	
+
+@-----------------------------------------------------------------------@
+@-----------------------------------------------------------------------@
+@                           BLOC 2: RECURSION				@
+@-----------------------------------------------------------------------@
+@-----------------------------------------------------------------------@
+
+
+/* Gauss-Hermite integration points and weights:
+ _xg: endogenous grid; _wg: weights */
+
+{_xg,_wg}=GAUHER(_ni);
+
+/* Grid over cash on hand; _xmin and _xmax exogenous; Program linearizes
+outside the grid */
+
+eps = 1e-5;
+_xc=seqa(_xmin+eps,(_xint-_xmin-eps)/(_Nint),_Nint)|
+    seqa(_xint,(_xmax-_xint)/(_Nmax-_Nint-1),_Nmax-_Nint);
+
+
+/* set up the shocks */
+if _cont==0;
+	_u=rndn(_nn,_tr); /* log transitory shock. Log normal part */
+	_n=rndn(_nn,_tr); /* log permanent shock                   */
+/* the shocks are cleared from memory as the matrices are too large. They are
+** called each time when simulation itself is called
+*/
+	save path=^pathres ^_unam=_u;
+	save path=^pathres ^_nnam=_n;
+	if _psho == 1;
+		_v=rndu(_nn,_tr); /* zero shock */
+		save path=^pathres ^_vnam=_v;
+		clear _v;
+	endif;
+	clear _u,_n;
+endif;
+
+
+if _contx==0;
+	_w=rndn(_nn,1); /* log transitory shock. Log normal part */
+	save ^_wnam=_w;
+	clear _w;
+endif;
+
+
+/* PROFILE'S PARAMETERS transfered to global variables */
+_gg	= g;		/* growth permanent income */
+_gam0	= gam0;		/* c-x ratio in last period */
+_gam1	= gam1;
+_vt0	= vt0;		/* transitory shocks std deviation 	*/
+_vp0	= vp0;		/* permanent shocks std deviation 	*/
+_polY	= polY;		/* income profile parameters		*/
+_mu1	= 0;		/* mean of log shock in simulations 	*/
+_mn1	= 0;
+_mu	= 0;		/* mean of log shock in Euler equation */
+_mn	= 0;                 
+_poly	= poly;
+
+
+/* TRACKING VARIABLES						*/
+btrac	= {};	/* beta-vector	*/
+r0trac	= {};	/* r0-vector	*/
+gamtrac	= {};	/* gam matrix	*/
+x0trac	= {};	/* x0 vector	*/
+ptrac	= {};	/* p vector		*/
+dtrac	= {};	/* distance vector */
+drtrac	= {};	/* first diff. distance vector */
+xmtrac	= {};	/* max normalized cash-on-hand sim.(vector) */
+ctrac	= {};	/* profile in the simulation (matrix,T rows)*/
+tctrac	= {};	/* max return code */
+
+
+/* initialize the buffer collecting results */
+trac_f 	= 0;			/* buffer file	*/
+trac_ni	= "TRAC_"$+intc;	/* buffer in	*/
+trac_nf = "TRAC_"$+outc;	/* buffer out	*/
+
+IF _trac==1;
+	LOADM path=^pathres trac_i = ^trac_ni;
+	IF _app == 1;
+		trac_f = trac_i;
+		btrac  = VREAD(trac_i,"btrac");
+		r0trac = VREAD(trac_i,"r0trac");
+		gamtrac= VREAD(trac_i,"gamtrac");
+		x0trac = VREAD(trac_i,"x0trac");
+		ptrac  = VREAD(trac_i,"ptrac");
+		dtrac  = VREAD(trac_i,"dtrac");
+		drtrac = VREAD(trac_i,"drtrac");
+		xmtrac = VREAD(trac_i,"xmtrac");
+		ctrac  = VREAD(trac_i,"ctrac");
+		tctrac = VREAD(trac_i,"tctrac");
+	ELSE;
+		bi  = VREAD(trac_i,"btrac");
+		r0i = VREAD(trac_i,"r0trac");
+		gami= VREAD(trac_i,"gamtrac");
+		x0i = VREAD(trac_i,"x0trac");
+		ppi = VREAD(trac_i,"ptrac");
+		di  = VREAD(trac_i,"dtrac");
+		dri = VREAD(trac_i,"drtrac");
+		xmi = VREAD(trac_i,"xmtrac");
+		ci  = VREAD(trac_i,"ctrac");
+		tci = VREAD(trac_i,"tctrac");
+		CLEAR trac_i;
+	ENDIF;
+ENDIF;
+
+format /rd 6,4;
+
+
+/* loads initial parameters*/
+
+IF _app ==0 AND _trac==1;
+	din	= MININDC(di);
+	Beta0	= bi[din];
+	R0	= r0i[din];
+	_gam1	= gami[din,2];
+	_gam0	= gami[din,1];
+ELSEIF _app == 1 AND _trac == 1;
+	din	= MININDC(dtrac);
+	Beta0	= btrac[din];
+	R0	= r0trac[din];
+	_gam0	= gamtrac[din,1];
+	_gam1	= gamtrac[din,2];
+ELSE;
+	Beta0	= 0.9463;
+	R0	= 1.0771;
+	_gam0	= 0.0196; 
+	_gam1	= 0.0529;
+	_gam1	= 0.0533;
+ENDIF;
+
+
+/* constructs full vector of parameters  and extracts selected ones */
+PAR	= Beta0|R0|_x0|_gam0|_gam1|_p|_rr|_vt0|_vp0|_polY|_polF;
+PAR[6]	= (_psho==0)*1+(_psho==1)*_p;
+_ParI	= FormPar(PAR);
+ParSel	= SELIF(_ParI,_parm .== 1);
+
+
+trac_f = VPUT(trac_f,_parm,"_parm");
+trac_f = VPUT(trac_f,_diff,"_diff");
+trac_f = VPUT(trac_f,_psho,"_psho");
+trac_f = VPUT(trac_f,shtc,"shtc");
+trac_f = VPUT(trac_f,swtc,"swtc");
+trac_f = VPUT(trac_f,intc,"intc");
+trac_f = VPUT(trac_f,_gr,"_gr");
+trac_f = VPUT(trac_f,_op,"_op");
+trac_f = VPUT(trac_f,_Nr,"_Nr");
+trac_f = VPUT(trac_f,_Nx,"_nx");
+trac_f = VPUT(trac_f,_Ni,"_Ni");
+trac_f = VPUT(trac_f,_x0,"_x0");
+trac_f = VPUT(trac_f,_sw,"_sw");
+trac_f = VPUT(trac_f,PAR,"Par0");
+SAVE path=^pathres ^trac_nf = trac_f;
+
+
+if _diag == 1;
+	print "Start DistBR";
+	ff = distBR(ParSel);
+	print "Done DistBR";
+	#ifunix;
+		wattr=miss(zeros(13,1),0);
+		fg = winopenpqg(wattr,"","");
+		fout=winsetactive(fg);
+	#endif;
+	xy(_xc,_cf);
+	#ifunix;
+	fg=winsetactive(fout);
+	#endif;
+endif;
+
+
+
+format /rd 4,6;
+IF _gr==1;
+	{BetGR,R0GR,DGR,DRGR} = GRIDBR(_BetMin,_BetMax,_R0Min,_R0Max,_NBet,_NR0);
+	trac_f = VPUT(trac_f,BetGR,"BetGR");
+	trac_f = VPUT(trac_f,R0GR,"R0GR");
+	trac_f = VPUT(trac_f,DGR,"DGR");
+	trac_f = VPUT(trac_f,DRGR,"DRGR");
+	SAVE path=^pathres ^trac_nf = trac_f;
+ENDIF;
+
+/* OPTIMIZATION */
+IF _var == 1;
+	_op = 0;
+ENDIF;
+IF _op==1;
+	if _gr == 1;
+		Beta0	= BetGR[minindc(minc(DGR'))];
+		R0	= R0GR[minindc(minc(DGR))];
+	endif;
+	{ParF,ff,gg,rc}=OPTMUM(&distBR,ParSel);
+	ParOpt  = FillPar(_ParI,ParF,_parm);
+	ParOpt  = FormInvPar(ParOpt);
+	copt = ctrac[.,minindc(dtrac)]~ctrac[.,minindc(drtrac)];
+	trac_f = SavTrac(btrac,r0trac,x0trac,gamtrac,ptrac,dtrac,drtrac,xmtrac,ctrac,tctrac,trac_f,trac_nf);
+	trac_f = VPUT(trac_f,ParOpt,"ParOpt");
+	trac_f = VPUT(trac_f,rc,"RCopt");
+	trac_f = VPUT(trac_f,copt,"copt");
+	SAVE path=^pathres ^trac_nf = trac_f;
+ENDIF;
+
+IF _test == 1;
+	screen on;
+	print time;
+	screen off;
+	idold = _id;
+	_id = 0;
+	dd = distBR(ParSel);
+	_id = idold;
+	screen on;
+	print time;
+ENDIF;
+
+IF _var==1;
+	/* FIRST STAGE VARIANCE */
+	IF _op == 0;
+		di = VREAD(trac_i,"dtrac");
+		dri= VREAD(trac_i,"drtrac");
+		bi = VREAD(trac_i,"btrac");
+		ri = VREAD(trac_i,"r0trac");
+		gami=VREAD(trac_i,"gamtrac");
+		x0i= VREAD(trac_i,"x0trac");
+		ppi = VREAD(trac_i,"ptrac");
+		ci = VREAD(trac_i,"ctrac");
+		din= MININDC(di)~MININDC(dri);
+		din = din[_diff+1];
+		beta0	= bi[din];
+		r0	= ri[din];
+		_gam0	= gami[din,1];
+		_gam1	= gami[din,2];
+		_x0	= x0i[din];
+		_p	= ppi[din];
+		copt = ctrac[.,MININDC(di)]~ctrac[.,MININDC(dri)];
+		ParOpt	= Beta0|R0|_x0|_gam0|_gam1|_p|_rr|_vt0|_vp0|_polY|_polF;
+	ELSE;
+		ParOpt	= Par;
+	ENDIF;
+	_ParI	= FormPar(ParOpt);
+	ParSel	= SELIF(_parI,_parm .== 1);
+
+	{grad1,VC1,Ov1}= Var1b(&_MomPar,ParSel,_cc,copt[.,_diff+1],_c,Itm,taui,_opw,_diff);
+
+	trac_f = VPUT(trac_f,grad1,"grad1");
+	trac_f = VPUT(trac_f,VC1,"VC1");
+	trac_f = VPUT(trac_f,Ov1,"Ov1");
+	trac_f = VPUT(trac_f,_Om1,"_Om1");
+	trac_f = VPUT(trac_f,_Om2,"_Om2");
+	trac_f = VPUT(trac_f,_opw,"_opw");
+	trac_f = VPUT(trac_f,_W1,"_W1");
+	trac_f = VPUT(trac_f,_W2,"_W2");
+	trac_f = VPUT(trac_f,ItM,"ITm");
+	trac_f = VPUT(trac_f,taui,"taui");
+	SAVE path=^pathres ^trac_nf = trac_f;
+
+	IF _var2 == 1;
+		/* SECOND STAGE VARIANCE CORRECTION */
+		/* 	VM: VC of first stage estimators;
+		VM is 20x20, i.e. includes ALL parameters
+		*/
+
+		{grad2,VC2,Wout,Ov2} = Var2(&_MomPar,grad1,0,ItM,_ParI,taui,VM,_diff);
+		trac_f	= VPUT(trac_f,VC2,"VC2");
+		trac_f	= VPUT(trac_f,grad2,"grad2");
+		trac_f	= VPUT(trac_f,_parv,"_parv");
+		trac_f	= VPUT(trac_f,Wout,"_Wout");		
+		trac_f	= VPUT(trac_f,Ov2,"Ov2");		
+		SAVE path=^pathres ^trac_nf = trac_f;
+	ENDIF;
+
+ENDIF;
+
+@-----------------------------------------------------------------------@
+@-----------------------------------------------------------------------@
+@                           BLOC 3: PROCEDURES				@
+@-----------------------------------------------------------------------@
+@-----------------------------------------------------------------------@
+
+
+Proc FormPar(par);
+/* transforms Par vector of parameters to impose nonnegativity and 0<beta<1
+** INPUT:
+**	par	: 20x1 vector defined as Parm.
+** OUTPUT:
+**	zz	: 20x1 vector transformed
+** GLOBALS: None
+*/
+  LOCAL zz;
+	zz=SQRT(par[1:9])|par[10:ROWS(par)];
+	zz[1]=SQRT(-LN(par[1]));	/* Beta */
+	zz[5]=SQRT(-LN(par[5]));	/* gam1	*/
+	zz[6]=SQRT(-LN(par[6]));	/* _p	*/
+  RETP(zz);
+ENDP; /* FormPar(par) */
+
+Proc FormInvPar(par);
+/* Inverse Transformation of FormPar
+** INPUT:
+**	par	: 20x1 transformed vector defined as Parm.
+** OUTPUT:
+**	zz	: 20x1 vector de-transformed
+** GLOBALS: None
+*/
+  LOCAL zz;
+	zz=(par[1:9].*par[1:9])|par[10:ROWS(par)];
+	zz[1]=EXP(-par[1]^2);	/* Beta */
+	zz[5]=EXP(-par[5]^2);	/* gam1	*/
+	zz[6]=EXP(-par[6]^2);	/* _p	*/
+  RETP(zz);
+ENDP; /* FormPar(par) */
+
+proc FillPar(par,pars,parm);
+/* fills in the optimized parameters
+** INPUT:
+**	par	: kx1 vector of estimated parameters.
+**	pars	: 20x1 vector to be filled
+**	parm	: indicator for paramters to estimate.
+** OUTPUT:
+**	par_out	: 20x1 vector filled
+** GLOBALS: None
+*/
+  LOCAL i,j,n,par_out;
+	n = ROWS(par);
+	par_out= par;
+	j = 1;
+	i = 1; DO WHILE i LE n;
+		IF parm[i] == 1;
+			par_out[i] = pars[j];
+			j = j+1;
+		ENDIF;
+	i = i+1; ENDO;
+  RETP(par_out);
+ENDP;
+
+
+proc dU(c);
+/* marginal utility of the CRRA form. Uses a first order approximation if c<em
+** INPUT:
+**	c	: nxm matrix. n and m unrestricted
+** OUTPUT:
+**		: nxm matrix of dU(c)
+** GLOBALS:
+**	_r0	: CRRA coeff
+*/
+   local tt,c2,c1,em;
+	em = 1e-4;
+	tt=c.>=em;
+	IF ROWS(PACKR(MISS(tt,0)))<ROWS(tt);
+		c2=missrv(miss(c.*tt,0),1);
+		c2=c2^(-_r0);
+		c1=em^(-_r0)-_r0*(c-em)*em^(-_r0-1);
+		retp(c2.*tt+(1-tt).*c1);
+	ELSE;
+		retp(c^(-_r0));
+	ENDIF;	
+endp; /* du(c) */
+
+proc DU1(c);
+/* same as above with different em value */
+  local tt,c2,c1,em;
+	If _psho == 1;
+		em = (1e+200)^(-1/_r0);
+	else;
+		em = 1e-20;
+	endif;
+	tt = c.>=em;
+	IF ROWS(PACKR(MISS(tt,0)))<ROWS(tt);
+		c2 = missrv(miss(c.*tt,0),1);
+		c2 = c2^(-_r0);
+		c1 = em^(-_r0)-_r0*(c-em)*em^(-_r0-1);
+		retp(c2.*tt+(1-tt).*c1);
+	ELSE;
+		retp(c^(-_r0));
+	ENDIF;
+endp;
+
+@------------------------Gauss-Hermite quadrature Procedures------------@
+
+proc(2)= gauher(n);
+/* returns the abscissas and weights of the Gauss-Hermite quadrature. From Numerical Recipes in C
+** INPUT:
+**	n: order of the quadrature
+** OUTPUT:
+**	x: nodes of quadrature
+**	w: weights
+** GLOBALS: none;
+*/
+  local x,w,m,p1,p2,p3,pp,z,z1,i,its,j,pima,maxit,eps;
+     x=zeros(n,1);w=zeros(n,1);
+     eps=3.0e-14;
+     maxit=10;
+     pima=(pi)^(-1/4);
+     m=(n+1)/2;
+     i=1;do while i le m;
+      if i==1;
+           z= sqrt(2*n+1)-1.85575*((2*n+1)^(-0.16667));
+      elseif i==2;
+           z= z-1.14*((n^0.426))/z;/* check */
+      elseif i==3;
+           z= 1.86*z-0.86*x[1];
+      elseif i==4;
+           z=1.91*z-0.91*x[2];
+      else;
+           z=2.0*z-x[i-2];
+      endif;
+      its=1; do while its le maxit;
+           p1=pima;
+           p2=0.0;
+           j=1; do while j le n;
+            p3=p2;
+            p2=p1;
+            p1=z*sqrt(2.0/j)*p2-sqrt((j-1)/j)*p3;
+           j=j+1; endo;
+      pp=sqrt(2*n)*p2;
+      z1=z;
+      z=z1-p1/pp;
+      if abs(z-z1) le EPS;
+           break;
+      endif;
+      its=its+1; endo;
+      if (its>maxit);
+           errorlog("too many iterations in gauher");
+           end;
+      endif;
+      x[i]=z;
+      x[n+1-i]=-z;
+      w[i]=2.0/(pp*pp);
+      w[n+1-i]=w[i];
+     i=i+1; endo;
+  retp(x,w);
+endp;
+
+
+proc Integ1(&fct,ci,c,x,u,g);
+/* returns the integrand of the Gauss-Hermite quadrature. Current income is 0.
+** INPUT:
+**	fct	: pointer to interpolation routine
+**	ci	: next period consumption function on the grid
+**	c	: today's consumption
+**	x	: today's cash on hand.
+**	u	: _nix1 vector of shocks
+**	g	: growth of expected income.
+** OUTPUT:
+**	z	: _nix_ni matrix of elements dU(c(R(x-c)/Gn)Gn)
+** GLOBALS:
+**	_sp	: standard error of permanent shocks
+**	_mn	: mean of shocks
+**	_f	: family shifter
+**	_rr	: gross interest rate
+*/
+  local z,fct:proc;
+  z=dU1(fct(_rr*(x-c)/g/_f*exp(-sqrt(2)*_sp*u-_mn),ci)*g.*exp(sqrt(2)*_sp*u+_mn))
+     *pi^(-1/2);
+  retp(z);
+endp;
+
+proc Integ2(&fct,ci,c,x,u,y,g);
+/* returns the integrand of the Gauss-Hermite quadrature
+** INPUT:
+**	fct	: pointer to interpolation routine (ccd or ccdold)
+**	ci	: next period consumption function on the grid
+**	c	: today's consumption
+**	x	: today's cash on hand.
+**	u	: _nix1 vector of permanent shocks
+**	y	: _nix1 vector of transitory shocks
+**	g	: growth of expected income.
+** OUTPUT:
+**	z	: _nix_ni matrix of elements dU(c(R(x-c)/Gn+u)Gn)
+** GLOBALS:
+**	_sp	: standard error of permanent shocks
+**	_st	: standard error of transitory shocks
+**	_mn	: mean of permanent shocks
+**	_mu	: mean of transitory shocks
+**	_f	: family shifter
+**	_rr	: gross interest rate
+*/
+  local z,rr,r1,t,n,fct:proc;
+     z=dU(fct(_rr*(x-c)/g/_f*exp(-sqrt(2)*_sp*u-_mn)+exp(sqrt(2)*_st*y'+_mu),ci)
+     *g.*exp(sqrt(2)*_sp*u+_mn))/pi;
+  retp(z);
+endp;
+
+@------------------------Euler Equation Procedures----------------------@
+
+proc _euler_1(&fct,ci,c,x,g);
+/* Euler equation residual.
+** INPUT:
+**	fct	: pointer to interpolation routine
+**	ci	: next period consumption function on the grid
+**	c	: today's consumption
+**	x	: today's cash on hand.
+**	g	: growth of expected income.
+** OUTPUT:
+**	z	: residual.
+** GLOBALS:
+**	_ind	: counter _tr-age. 
+**	_wg	: weights for Gauss Hermite quadarture
+**	_xg	: nodes for GH quadrature
+**	_beta	: discount factor
+**	_rr	: gross interest rate
+*/
+  local z,I1,I2,f1,f2,pm,fct:proc;
+		if c == x and _ind>1;
+			I1 = 1.67e307;
+		else;
+			f1=Integ1(&fct,ci,c,x,_xg,g);
+			I1=_wg'f1*_p;
+		endif;
+	f2=Integ2(&fct,ci,c,x,_xg,_xg,g);
+	I2=_wg'f2*_wg*(1-_p);
+	z=du(c)-_beta*_rr*(I2+I1);
+  retp(z);
+endp;
+
+proc _euler_0(&fct,ci,c,x,g);
+/* Euler equation residual. No zero income shock.
+** INPUT:
+**	fct	: pointer to interpolation routine
+**	ci	: next period consumption function on the grid
+**	c	: today's consumption
+**	x	: today's cash on hand.
+**	g	: growth of expected income.
+** OUTPUT:
+**	z	: residual.
+** GLOBALS:
+**	_wg	: weights for Gauss Hermite quadarture
+**	_xg	: nodes for GH quadrature
+**	_beta	: discount factor
+**	_rr	: gross interest rate
+*/
+  local z,I1,I2,f1,f2,pm,fct:proc;
+	f2=Integ2(ci,c,x,_xg,_xg,g);
+	I2=_wg'f2*_wg;
+	z=du(c)-_beta*_rr*I2;
+  retp(z);
+endp;
+
+proc _euler_last(c,x,g);
+/* Euler equation residual/ last working period.
+** INPUT:
+**	c	: today's consumption
+**	x	: today's cash on hand.
+**	g	: growth of expected income.
+** OUTPUT:
+**	z	: residual.
+** GLOBALS:
+**	_gam1/0	: coefficients of the C-rule at retirement
+**	_beta	: discount factor
+**	_rr	: gross interest rate
+*/
+  local z;
+	z=du(c)-_beta*_rr*du((_gam1*_rr*(x-c)+_gam0)/g);
+  retp(z);
+endp;
+
+
+proc Euler_1(cs);
+/* Euler equation residual. Argument to NLSYS2
+** INPUT:
+**	cs	: normalized current consumption
+** OUTPUT:
+**	z	: residual.
+** GLOBALS:
+**	_ccold	: global for interpolation routine
+**	_x	: initial cash on hand
+**	_ci	: next period c(x) on grid
+**	_g	: growth in expected permanent income
+*/
+  local z,c,procvec,fct;
+	procvec = &ccd~&ccdold;
+	fct = procvec[_ccdold+1];
+  local fct:proc;
+	if scalmiss(packr(cs));
+		retp(miss(zeros(rows(cs),cols(cs)),0));
+	else;
+     c=exp(-cs^2)*_x;
+     z=_euler_1(&fct,_ci,c,_x,_g);/* forces 0<c<x */
+  retp(z);
+	endif;
+endp;
+
+proc Euler_0(cs);
+/* Euler equation residual, no 0 income shock. Argument to NLSYS2
+** INPUT:
+**	cs	: normalized current consumption
+** OUTPUT:
+**	z	: residual.
+** GLOBALS:
+**	_ccold	: global for interpolation routine
+**	_x	: initial cash on hand
+**	_ci	: next period c(x) on grid
+**	_g	: growth in expected permanent income
+*/
+  local z,c,procvec,fct;
+	procvec = &ccd~&ccdold;
+	fct = procvec[_ccdold+1];
+  local fct:proc;
+     c=exp(-cs^2)*_x;
+     z=_euler_0(&fct,_ci,c,_x,_g);/* forces 0<c<x */
+  retp(z);
+endp;
+
+proc Euler_last(cs);
+/* Euler equation residual. last working period. Argument to NLSYS2
+** INPUT:
+**	cs	: normalized current consumption
+** OUTPUT:
+**	z	: residual.
+** GLOBALS:
+**	_ccold	: global for interpolation routine
+**	_x	: initial cash on hand
+**	_ci	: next period c(x) on grid
+**	_g	: growth in expected permanent income
+*/
+  local z,c;
+     c=exp(-cs^2)*_x;
+     z=_euler_last(c,_x,_g);/* forces 0<c<x */
+  retp(z);
+endp;
+
+PROC(4)= NLSYS2(&fct,ct);
+/* Root Finder procedure. Calls NLSYS. Tests first for corner solution c=x.
+** INPUTS:
+**	fc	: pointer to function to minimize
+**	ct	: normalized consumption
+** OUTPUT:
+**	tt	: objective function at solution
+**	ww	: solution (normalized)
+**	qq	: gradient
+**	tc	: return code
+** GLOBALS:
+**	all the globals of NLSYS
+*/
+  LOCAL e1,tt,ww,qq,tc,fct:proc;
+    e1=fct(0); /* corner c=_x */
+    IF e1>0;
+	RETP(0,0,0,-1);
+    ELSE;
+	{tt,ww,qq,tc}=NLSYS(&fct,ct);
+	RETP(tt,ww,qq,tc);
+    ENDIF;
+ENDP;
+
+
+PROC ccd(xx,ci);
+/* Interpolation Routine. Fast procedure by Grigory Kosenok.
+** Note that this procedure is grid dependend and is therefore not tranposable to any grid.
+** extrapolation is lineatr outside the grid.
+** INPUT:
+**	xx	: nxm matrix of points x at which we want to evaluate the rule
+**	ci	: Nmaxx1 consumption rule.
+** OUTPUT
+**	cc	: nxm matrix of ci(xx);
+** GLOBALS: None
+*/
+  LOCAL K, j, cc, H, s, Sl, Co, Xgr, c, gr, n, Ind, x, x0, dH , Nint,w;
+
+	x	= xx;
+	Sl	= ZEROS(ROWS(x),COLS(x));
+	Co	= Sl;
+	gr	= _xc;	@ grid			@
+	c	= ci;	@ values on grid	@
+	Nint	= _Nint;
+
+	H = gr[ _Nmax ] - gr[ _Nmax-1 ];	@ standard step size	@
+
+	IF _tr > _ti;	gr = 0|gr; c = 0|c; Nint = Nint+1; ENDIF;
+
+	@ we need to correct grid	@
+	s  = gr[Nint+1];
+	Ind= ( x.< s);	@ correction at Nint+1 @
+	x0 = x.*Ind;
+	dH = ( gr[Nint+1] - gr[Nint] );
+	x = (x -x0) + s*Ind +  ( x0 - s*Ind ) * H / dH;	/* scales uniformly the grid at Nint */
+	w = gr[1:(Nint),1]; gr[1:(Nint),1] = s+(w-s )*H/dH;
+
+	IF _tr > _ti;
+		s = gr[2];
+		ind = ( x.< s);	@ correction at 1	@
+		x0 = x.*Ind; dH = ( gr[ 2 ] - gr[1] );
+		x = (x -x0) + s*Ind +  ( x0 - s*Ind ) * H / dH;
+		gr[1] = s + (gr[1]-s)*H/dH;
+	ENDIF;
+
+
+	s = ( SHIFTR(c',1,0)' - c )./ ( SHIFTR(gr',1,9999)' - gr ); /* slopes */
+	s = ( c-SHIFTR(c',1,0)' )./ H; /* slopes */
+	s = s[2:ROWS(s),1];
+
+	K = FLOOR( ( x - gr[1] ) / H + 1 ); @ Make right indeces	@
+	K = (K.>0) .* K + (K.<1);
+	n = ROWS(s);
+	K = (K.<(n+1) ) .* K + (K.>n) * n;
+
+	Xgr = gr[1] + (K-1) * H;
+
+		FOR j (1, COLS(x),1);
+			Sl[.,j]  = s[ K[.,j] ];
+			Co[.,j] = c[ K[.,j] ];
+		ENDFOR;
+		cc = Co + ( x - Xgr) .* Sl;
+
+  RETP(cc);
+ENDP;
+
+
+proc ccdold(x,ci);
+/* Old Interpolation Routine. More Robust procedure than ccd, but much slower
+** Note that this procedure is NOT grid dependend and is therefore tranposable to any grid.
+** approximate outside the range [xmin,xmax] by a linear extrapolation
+** INPUT:
+**	x	: nxm matrix of points x at which we want to evaluate the rule
+**	ci	: Nmaxx1 consumption rule.
+**	either ci or x has to be a column vector
+** OUTPUT
+**	cc	: nxm matrix of ci(xx);
+** GLOBALS: None
+*/
+  local zz,zx,zc,zl,n,c,j,cc,sl,tt,sc,uu,x1,x2,x3,c1,c2,c0,x0,nn;
+    IF _ti == _tr;
+	c0 = ci;
+	x0 = _xc;
+    ELSE; /* forces c(0)=0 */
+	c0 = 0|ci;
+	x0 = 0|_xc;
+    ENDIF;
+    nn = ROWS(c0);
+    c1=c0|c0[nn,.];
+    c2=shiftr(c1',1,0)';
+    c2[1,.]=c1[1,.];
+    x1=x0|9999;
+    x2=shiftr(x1',1,-9999)';
+    x3=x2;
+    x3[1,.]=x1[1,.];
+    sl=(c1-c2)./(x1-x2);
+    sl[nn+1,.]=sl[nn,.];
+    sl[1]=(c1[2,.]-c1[1,.])./(x1[2]-x1[1]);
+    c=cols(x);n=rows(x);
+    cc=miss(zeros(n,c),0);
+    j=1; do while j le c;
+        zz=(x[.,j].<x1').*(x[.,j].>=x2');
+        zx=zz*x3;
+        zc=zz*c2;
+        zl=zz*sl;
+        cc[.,j]=zc+zl.*(x[.,j]-zx);
+    j=j+1; endo;
+retp(cc);
+endp;
+
+@------------------------Algorithm Procedures---------------------------@
+
+proc rule(nmax,gam0,gam1,g,vt,vp,tr,xc,beta);
+/* computes the consumption rules given last period c-rule and expected income growth g
+** INPUT:
+**	nmax	: number of grid points.
+**	gam0/1	: paramters of last period c-rule: c(x) = gam0+gam1 x
+**	g	: _tr x 1 vector of growth rates of expected permanent income
+**	vt	: variance of transitory income shocks
+**	vp	: variance of permanent income shocks
+**	xc	: grid of cash on hand. Nmax x 1 vector.
+**	beta	: discount factor
+** OUTPUT:
+**	ci	: Nmax x (_tr+1) matrix with consumption rule in every period.
+** GLOBALS
+**	_fam	: global for family adjustment
+**	tctrac	: tracking device for maximum return code.
+**	_beta	: discount factor
+**	_st	: standard deviation transitory income shocks
+**	_sp	: standard deviation permanent income shocks
+**	_ti	: _tr-age
+**	_ci	: next period consumption rule
+**	_g	: growth of expected permanent income
+**	_f	: family shifter
+**	_cf	: current consumption rule (used in diagnostic)
+**	_tci	: matrix of return codes from NLSYS
+*/
+  local ci,tc,n,i,tt,ww,qq,tmax,fct,procvec,ff;
+	procvec = &euler_0~&euler_1;
+	fct = procvec[_psho+1];
+	local fct:proc;
+    _beta=beta;
+    _st=sqrt(vt);
+    _sp=sqrt(vp);
+    ci=zeros(Nmax,tr+1);
+    ci[.,tr+1]=gam0+gam1*xc;/* final consumption function */
+    _tci=zeros(Nmax,tr);
+    screen on;
+    format /rd 3,4;
+    print "Iteration No: " _ct " Beta= " _beta "_R0  = " _r0;
+    print "_p=" _p "_x0: " _x0 "_gam0= " gam0  "_gam1= " gam1;
+  screen off;
+    IF _fam == 1;
+	ff = _f0;
+    ELSE;
+	ff = ONES(40,1);
+    ENDIF;
+    n = 1;do while n le tr;
+	print "age:" n;
+	_ind = n;
+    _ti = tr-n+1;
+    _ci=ci[.,tr-n+2];_g=g[tr-n+1];_f = ff[tr-n+1];
+	If ROWS(_ci)/=ROWS(PACKR(_ci));
+		ci[.,tr-n+1] = MISS(ZEROS(Nmax,1),0);
+		_cf = ci;
+		_tci[.,tr-n+1]=ONES(Nmax,1)*999;
+	ELSE;
+	    i=1;do while i le Nmax;
+			_x=xc[i];
+			IF n >1 AND _ci[i]/=_x;
+		        {tt,ww,qq,tc}=NLSYS2(&fct,sqrt(-ln(_ci[i]/_x)));/* default is 0.5 */
+			ELSEIF n==1;
+				{tt,ww,qq,tc}=NLSYS2(&Euler_last,sqrt(-ln(0.5)));
+			ELSE;
+				{tt,ww,qq,tc}=NLSYS2(&fct,sqrt(-ln(0.5)));
+			ENDIF;
+	        ci[i,tr-n+1]=exp(-tt^2)*_x;
+			_cf = ci;
+	        _tci[i,tr-n+1]=tc;
+	    i = i+1;endo;
+	ENDIF;
+    n = n+1;endo;
+    tmax=maxc(maxc(_tci));
+    tctrac=tctrac|tmax;
+  retp(ci);
+endp; /* RULE() */
+
+proc sim(ci,g,y,vt,vp,ns,tr,id);
+/* Simulation algorithm.
+** INPUTS:
+**	ci	: _Nmax x (_tr+1) matrix with c-rules at every age
+**	g	: _tr x 1 vector of growth in expected permanent income
+**	y	: expected permanent income profile
+**	vt	: variance of transitory income shocks
+**	vp	: variance of permanent income shocks
+**	ns	: number of profiles generated
+**	tr	: number of periods
+**	id	: if 1 saves generated profiles to data buffer.
+** OUTPUT
+**	cm	: tr x 1 vector of average consumption over age
+** GLOBALS
+**	_nr	: number of profiles read at a time
+**	trac_f	: data buffer 	
+**	trac_nf	: string for data buffer
+**	_wnam	: string name of initial wealth shock file
+**	_unam	: string name of transitory income shock file
+**	_nnam	: string name of permanent income shock file
+**	_psho	: 1 if 0-income shocks are present
+**	_shx	: 1 if uses shocks to initial wealth
+**	_w	: initial wealth
+**	_u	: transitory income shocks
+**	_n	: permanent income
+**	_v	: 0-income shock
+**	_p	: probability of 0 income shock
+**	_x0	: average initial wealth
+**	_sw	: standard deviation of log initial wealth
+**	_ccold	: interpolation method. 1 is old, 0 is current
+**	_xxm	: maximum cash on hand in simulations (over age), used to
+**		check whether there are a lot of simulation outside the grid
+**	_mu1	: mean of log transitory income shocks
+**	_mn1	: mean of log of permanent income shocks
+*/
+  local mut,mup,xsn,csn,ypn,i,cm,xm,ysn,st,sp;
+  local fu,fm,fv, nn, n0,z, csout, ysout, ypout, xsout,j,ff,fw;
+    IF _fam == 1;
+	ff = _f0;
+    ELSE;
+	ff = ONES(40,1);
+    ENDIF;
+
+	IF ROWS(ci)/=ROWS(PACKR(ci));
+		RETP(MISS(ZEROS(TR,1),0));
+		if id == 1;
+			trac_f = VPUT(trac_f,MISS(0,0),_csn);
+			trac_f = VPUT(trac_f,MISS(0,0),_ysn);
+			trac_f = VPUT(trac_f,MISS(0,0),_ypn);
+			trac_f = VPUT(trac_f,MISS(0,0),_xsn);
+			SAVE path=^pathres ^trac_nf = trac_f;
+		endif;
+		_xxm = MISS(0,0);
+	ELSE;
+		/* uses smaller matrices for simulation and adds */
+		OPEN fw=^_wnam;
+		OPEN fu=^_unam;
+		OPEN fm=^_nnam;
+		nn = ROWSF(fu);
+		if _psho == 1;
+			OPEN fv=^_vnam;
+		endif;
+		cm = zeros(tr,1); n0 = zeros(tr,1);
+		_xxm = 0; csout = {};
+		ysout = {}; ypout = {}; xsout = {};
+		j = 1; do while j le nn;
+			if _shx == 1;
+				_w = readr(fw,_nr);
+				_w=exp(_w*_sw);	   /* initial wealth shock */	
+			else;
+				_w=ONES(_nr,1);
+			endif;
+			_u = readr(fu,_nr);
+			_n = readr(fm,_nr);
+			j = j+_nr;
+		    st=sqrt(vt);
+		    sp=sqrt(vp);
+		    _u=exp(_u*st+_mu1); /* transitory shocks */
+		    _n=exp(_n*sp+_mn1); /* permanent shock   */
+			if _psho == 1;
+				_v = readr(fv,_nr);
+				_u = (_v.>_p).*_u;
+				clear _v;
+			endif;
+		    xsn= _u[.,1]+_x0*_w;/* normalized cash on hand */
+		    csn={};      /* normalized consumption  */
+		    ypn=y[1]*_n[.,1];
+		    i=1; do while i le tr-1;
+			_ti = i;
+			if _ccdold == 0;
+			       csn=csn~ccd(xsn[.,i],ci[.,i]);
+			elseif _ccdold == 1;
+			       csn=csn~ccdold(xsn[.,i],ci[.,i]);
+			endif;
+		       xsn=xsn~((_rr*(xsn[.,i]-csn[.,i])./(g[i]*_n[.,i+1]*ff[i]))+_u[.,i+1]);
+		       ypn=ypn~ypn[.,i].*_n[.,i+1]*g[i];
+		    i=i+1; endo;
+		    _ti = tr;
+			if _ccdold == 0;
+			    csn=csn~ccd(xsn[.,tr],ci[.,tr]);
+			elseif _ccdold == 1;
+			    csn=csn~ccdold(xsn[.,tr],ci[.,tr]);
+			endif;
+		    _cs = csn;
+		    /* deletes the y's with y=0 */
+		    csn = csn.*ypn;
+		    i=1; DO WHILE i LE tr;
+				z = ln(DELIF(csn[.,i],_u[.,i].==0));
+				n0[i] = n0[i]+rows(z);
+				cm[i] = cm[i]+sumc(z);
+		    i=i+1; ENDO;
+			if id == 1;
+				csout = csout|csn;
+				ypout = ypout|ypn;
+				ysout = ysout|(ypn.*_u);
+				xsout = xsout|xsn;
+				trac_f = VPUT(trac_f,csout,_csn);
+				trac_f = VPUT(trac_f,ysout,_ysn);
+				trac_f = VPUT(trac_f,ypout,_ypn);
+				trac_f = VPUT(trac_f,xsout,_xsn);
+				SAVE path=^pathres ^trac_nf = trac_f;
+			endif;
+		    _xxm = maxc(_xxm|maxc(maxc(xsn)));
+		endo;
+		cm = exp(cm./n0);
+		fu = close(fu);
+		fm = close(fm);
+		fw = close(fw);
+		if _psho == 1;
+			fv = close(fv);
+		endif;
+	    clear _u,_n;
+	  retp(cm);
+	ENDIF;
+endp; /* sim() */
+
+
+proc(2)= _dist2(c,g,gam0,gam1,y,vt,vp,nmax,nn,tr,xc,beta,id,opw);
+/* calculates the distance between average consumption and average simulated profiles
+** Note that the program accomodates stacked estimation using multiple columns.
+** This allows forcing some identical parameters across cells.
+** INPUTS:
+**	c	: data average consumption profiles. _tr x k.
+**	g	: growth of expected permanent income. _tr x 1
+**	gam0/1	: parameters of last period consumption rule for each data profile. k x 1.
+**	y	: expected permanent income _tr x k.
+**	vt	: variance of transitory income shock k x 1.
+**	vp	: variance of permanent income shock k x 1.
+**	nmax	: number of grid points.
+**	nn	: number of profiles simulated
+**	tr	: number of periods
+**	xc	: grid for cash on hand (normalized)
+**	beta	: discount factor
+**	id	: 1 if saves all intermediate results
+**	opw	: optimal weghting indicator. 0 no weights, 1 uses _W1 weights in levels and _W2 in differences
+** OUTPUT
+**	square root of objective function, for level and difference estimator.
+** GLOBALS
+**	__output: nlsys global. No output screen if 0
+**	trac_f	: data buffer
+**	trac_nf	: string for data buffer
+**	_cm	: current simulated profiles
+**	_ct	: counter.
+*/
+  local ddr,dd,nc,ci,cs,i,dcs,dc,t0,t1,d1,d2;
+    dd=0;ddr=0;
+    nc=cols(c);
+    i=1; do while i le nc;
+    __output = 0;
+    {ci}= rule(nmax,gam0[i],gam1[i],g[.,i],vt[i],vp[i],tr,xc,beta);
+    __output = 1;    
+    	if id==1;
+	        _cf = ci;
+		trac_f = VPUT(trac_f,ci,"ci");
+		SAVE path=^pathres ^trac_nf = trac_f;
+        endif;
+        {cs}= sim(ci,g[.,i],y[.,i],vt[i],vp[i],nn,tr,id);
+        _cm=cs;
+        IF opw == 0;    /* no weights */
+		dd=dd+sumc((ln(cs)-ln(c[.,i]))^2);
+		dc=ln(c[.,i])-miss(shiftr(ln(c[.,i])',1,0),0)';
+		dcs=ln(cs)-miss(shiftr(ln(cs)',1,0),0)';
+		ddr=ddr+sumc((dcs[2:tr]-dc[2:tr])^2);
+        ELSE;
+		d1 = ln(cs)-ln(c[.,i]);
+		dd = dd+d1'_w1*d1;
+		dc=ln(c[.,i])-miss(shiftr(ln(c[.,i])',1,0),0)';
+		dcs=ln(cs)-miss(shiftr(ln(cs)',1,0),0)';
+		d2 = dc[2:tr]-dcs[2:tr];
+		ddr= ddr+d2'_w2*d2;
+        ENDIF;
+    i=i+1; endo;
+    _ct=_ct+1;
+  retp(sqrt(dd/(tr*nc)),sqrt(ddr/((tr-1)*nc)));
+endp;
+
+
+proc distBR(par);
+/* main objective function routine. returns the level or difference distance
+** argument of the OPTMUM routine, which takes only 1 argument.
+** INPUTS:
+**	par	: vector of parameters to minimize over. k x 1
+** OUTPUT:
+**	df	: level of difference objective function
+** GLOBALS:
+**	_parI	: vector of transformed original paramters.
+**	_parm	: indicator for parameters we optimize over
+**	_bet	: discount factor
+**	_r0	: CRRA coefficient
+**	_x0	: initial mean asset level
+**	_gam0/1	: retirement consumption rule parameters (c(x) = gam0+gam1 x)
+**	_p	: probability of 0 income
+**	_rr	: gross interest rate
+**	_vt0	: variance of transitory income shocks
+**	_vp0	: variance of permanent income shocks
+**	dtrac	: tracking the distance (level)
+**	drtrac	: tracking the distance (difference)
+**	btrac	: tracking discount factor
+**	r0trac	: tracking the CRRA coeff.
+**	x0trac	: tracking mean initial asset level
+**	gamtrac	: tracking parameters of last period consumption rule
+**	xmtrac	: tracking max asset in simulated profiles
+**	ctrac	: tracking simulated average consumption
+**	_diff	: global for level (0) or difference (1) estimation
+*/
+  local d,dr,df,par_int,par_m,t0,t1;
+	par_int = FillPar(_ParI,par,_parm);
+	par_m 	= FormInvPar(par_int);
+	_bet	= par_m[1];
+	_r0 	= par_m[2];
+	_x0	= par_m[3];
+	_gam0	= par_m[4];
+	_gam1	= par_m[5];
+	_p	= par_m[6]*_psho;
+	_rr	= par_m[7];
+	_vt0	= par_m[8];
+	_vp0	= par_m[9];
+	t0	= date();
+	{d,dr}=_dist2(_c,_gg,_gam0,_gam1,_y,_vt0,_vp0,_nmax,_nn,_tr,_xc,_bet,_id,_opw);
+	dtrac=dtrac|d;drtrac=drtrac|dr;btrac=btrac|_bet;r0trac=r0trac|_r0;
+	x0trac = x0trac|_x0; gamtrac = gamtrac|(_gam0~_gam1); ptrac = ptrac|_p;
+	xmtrac=xmtrac|_xxm;ctrac=ctrac~_cm;
+	trac_f =
+SavTrac(btrac,r0trac,x0trac,gamtrac,ptrac,dtrac,drtrac,xmtrac,ctrac,tctrac,trac_f,trac_nf);
+	t1	= date();
+	screen on;
+	print "time: " ethsec(t0,t1)/100/60;
+	print "DD= " d "DDR= " dr;
+	screen off;
+	if _diff == 0;
+		df = d;
+	else;
+		df = dr;
+	endif;
+  retp(df);
+endp;
+
+proc _MomPar(par);
+/* claculates the vector of moments at the estimated parameters
+** INPUTS:
+**	par	: paramater vector k x 1
+** OUTPUT
+**	g	: 1 x _tr vector with ln(c-data)'-ln(c-simulated)' or the equivalent in differences
+** GLOBALS
+**	_bet	: discount factor
+**	_r0	: CRRA coefficient
+**	_x0	: initial mean asset level
+**	_gam0/1	: retirement consumption rule parameters (c(x) = gam0+gam1 x)
+**	_p	: probability of 0 income
+**	_rr	: gross interest rate
+**	_vt0	: variance of transitory income shocks
+**	_vp0	: variance of permanent income shocks
+**	_y	: expected permanent income
+**	_poly	: polynomial coefficients for _y
+**	_polf	: polynomial coeff for family shifter
+**	_f0	: family shifter
+**	_gg	: growth in expected permanent income
+**	_parI	: vector of transformed original paramters.
+**	_parm	: indicator for parameters we optimize over
+**	_scale	: 1 if scales polynomial coefficient for estimation
+**	_ct	: counter
+*/
+  local ci,cs,dcs,dc,beta,g;
+  local r0old,gam0old,gam1old,x0old,rrold,vt0old,vp0old,pold,betaold,yold,polyold;
+  local par_int,par_m, ages,i,polfold,ffold,gold,pp;
+	betaold= _bet;
+	r0old	= _r0;
+	pold	= _p;
+	gam0old=_gam0;
+	gam1old=_gam1;
+	x0old	=_x0;
+	rrold 	=_rr;
+	vt0old	=_vt0;
+	vp0old	=_vp0;
+	yold	= _y;
+	polyold= _poly;
+	polfold= _polf;
+	ffold	= _f0;
+	gold	= _gg;
+	/* _parI: initial, par: filler, _parm2: index	*/
+	par_int = FillPar(_ParI,par,_parm2);
+	par_m 	= FormInvPar(par_int);
+	_bet	= par_m[1];
+	_r0 	= par_m[2];
+	_x0	= par_m[3];
+	_gam0	= par_m[4];
+	_gam1	= par_m[5];
+	_p	= par_m[6];
+	_rr	= par_m[7];
+	_vt0	= par_m[8];
+	_vp0	= par_m[9];
+	_poly	= par_m[10:15];
+	_polF	= par_m[16:20];
+	if _scale == 1;
+		pp = _polY./_scy;
+		_y 	= exp(_agep*pp);
+		_f0 = _agep[.,1:5]*(_polF[1:5]./_scf);
+	else;
+		_y 	= exp(_agep*_polY);
+		_f0 = _agep[.,1:5]*_polF[1:5];
+	endif;
+
+	_gg = _y./MISS(SHIFTR(_y',1,-999)',-999);
+	_gg = _gg[2:rows(_y),.];
+
+	_f0 = EXP(_f0-LAG(_f0));
+	_f0 = _f0[2:41];
+
+	/* correction for growth rate of permanent income at age of retirement */
+	IF _fam == 1;
+		_gg[40]= 1/_f0[40];
+	ELSE;
+		_gg[40]= 1;
+	ENDIF;
+
+    	{ci}= rule(_nmax,_gam0,_gam1,_gg,_vt0,_vp0,_tr,_xc,_bet);
+	{cs}= sim(ci,_gg,_y,_vt0,_vp0,_nn,_tr,_id);
+	_cm=cs;
+	IF _diff == 0;
+		g = ln(cs)'-ln(_c)';
+	ELSEIF _diff==1;
+		dc=ln(_c)-miss(shiftr(ln(_c)',1,0),0)';
+		dcs=ln(cs)-miss(shiftr(ln(cs)',1,0),0)';	
+		g= dcs[2:_tr]'-dc[2:_tr]';
+	ENDIF;
+	_bet	= betaold;
+	_r0	= r0old;
+	_p	= pold;
+	_gam0	= gam0old;
+	_gam1	= gam1old;
+	_x0	= x0old;
+	_rr	= rrold;
+	_vt0	= vt0old;
+	_vp0	= vp0old;
+	_y	= yold;
+	_poly	= polyold;
+	_polf	= polfold;
+	_gg	= gold;
+	_f0	= ffold;
+	_ct=_ct+1;
+  retp(g);
+endp;
+
+PROC(4)= GRIDBR(BMin,BMax,RMin,RMax,NBeta,NR0);
+/* Grid program
+** INPUT:
+**	Bmin: minimum discount factor
+**	Bmax: maximum discount factor
+**	Rmin: minimum CRRA
+**	Rmax: maximum CRRA
+**	NBeta: number of points on Beta
+**	NR0: number of points on Rho
+** OUTPUT:
+**	Beta0	: Nbeta x 1 vector of Beta
+**	R0	: Nr0 x 1 vector of CRRA
+**	Dd	: Nbeta x Nr0 vector of distance (level)
+**	Ddr	: Nbeta x Nr0 vector of distance (difference)
+**
+*/
+  LOCAL BStep,Beta0,RStep,R0,dd,ddr,i,j,Betexp;
+    BStep = (BMax-BMin)/(NBeta-1);
+    Beta0=seqa(BMin,BStep,NBeta);
+    RStep = (RMax-RMin)/(NR0-1);
+    R0=seqa(RMin,RStep,NR0);
+    dd=miss(zeros(NR0,NBeta),0);/* results are collected in dd, ddr */
+    ddr=miss(zeros(NR0,NBeta),0);
+    format /rd 4,2;
+    i=1; do while i le NR0;
+        _R0=R0[i];
+        j=1; do while j le NBeta;
+        {Dd[i,j],Ddr[i,j]}=_dist2(_c,_gg,_gam0,_gam1,_y,_vt0,_vp0,_nmax,_nn,_tr,_xc,Beta0[j],0);
+		dtrac=dtrac|dd[i,j];drtrac=drtrac|ddr[i,j];btrac=btrac|Beta0[j];r0trac=r0trac|_r0;
+		xmtrac=xmtrac|_xxm;ctrac=ctrac~_cm;
+		x0trac = x0trac|_x0; gamtrac = gamtrac|(_gam0~_gam1); ptrac = ptrac|_p;
+		trac_f = SavTrac(btrac,r0trac,x0trac,gamtrac,ptrac,dtrac,drtrac,xmtrac,ctrac,tctrac,trac_f,trac_nf);
+		screen on;
+		print "DD= " dd[i,j] "DDR= " ddr[i,j];
+		screen off;
+        j=j+1; endo;
+    i=i+1; endo;
+    Beta0=exp(-Beta0^2);
+  RETP(Beta0,R0,Dd,Ddr);
+ENDP;
+
+/*------------------------GRADIENT-----------------------------------------*/
+PROC(3)= Om1(cc);
+/* computes the Omega matrix using only data. Diagonal matrix
+** computes matrices for level estimation and first difference
+** Note: only identity matrix for the time being for difference estimation. See Lab Notes
+** INPUT:
+**	cc	: NN x 2 matrix with age and individual consumption
+** OUTPUT
+**	Omega1	: inverse of weights in level
+**	Omega2	: inverse of weights for first difference
+**	Itm	: average number of observations per age.
+** GLOBAL
+**	_tr	: number of periods
+*/
+  LOCAL It, Omega1, Omega2, ITm, Ct, lCm, j;
+	It={};Omega1=miss(zeros(_tr,1),0);	/* level */
+	Omega2=miss(zeros(_tr,1),0);	/* first difference */
+	j=1; DO WHILE j LE _TR;
+		It=It|rows(selif(cc[.,1],cc[.,1].==j+25));
+		Ct=selif(cc[.,2],cc[.,1].==j+25);
+		lCm=MEANC(ln(Ct));
+		Omega1[j]=(ln(Ct)-lCm)'(ln(Ct)-lCm)/It[j];
+	j=j+1; ENDO;
+	Omega1 = DIAGRV(EYE(_TR),Omega1);
+	ItM=Meanc(It);
+	Omega2 = EYE(_TR-1);
+   RETP(Omega1,Omega2,ItM);
+ENDP; /* Om1 */
+
+
+PROC(3)= Var1b(&fn,par,cc,copt,c,Itm,taui,opw,diff);
+/* computes the Var-Cov matrix for second stage without correction for first stage
+** INPUT:
+**	fn	: procedure for the moments evaluated at the estimated parameters
+**	par	: vector of estimated parameters
+**	cc	: NN x 2 actual data and age
+**	copt	: simulated profile for average consumption
+**	c	: average profile for consumption (data)
+**	Itm	: average number of observations per age (data)
+**	taui	: inverse of number of profile per age (simulation)
+**	opw	: global for optimal weighting (1) or not
+**	diff	: estimation in levels or first difference.
+** OUTPUT:
+**	D	: gradient vector vis a vis optimied parameters
+**	VV	: VCV second stage
+**	Ov	: test of GMM overidentifying restrictions
+** GLOBALS:
+**	_om1	: inverse optimal weighting matrix, level
+**	_Om2	: inverse optimal weighting matrix, differences
+**	_W1	: optimal weighting matrix, level
+**	_W2	: optimal weighting matrix, difference
+**	_parm	: indicator for parameters
+**	_parm2	: same as _parm
+**	_gdcd()	: numerical gradient procedure in Gauss
+*/
+  LOCAL VV,VV1,D,Omt,Itmean,It;
+  LOCAL fn:proc,Ov,dc,dcopt,g,Om,W;
+	IF diff ==0;
+		Om = _Om1;
+		W  = _W1;
+	ELSEIF diff == 1;
+		Om = _Om2;
+		W  = _W2;
+	ENDIF;
+	_parm2 = _parm;
+	D = _gdcd(&fn,par,0); /* computes the gradient using OPTMUM numerical gradient */
+	IF opw == 1;
+		VV = (1+taui)*invpd(D'W*D)/Itm;
+	ELSE;
+		VV1= INVPD(D'W*D);
+		VV = VV1*D'*W*Om*W*D*VV1*(1+taui)/ITm;
+	ENDIF;
+
+	/* overidentification test */
+	g = ln(_c)-ln(copt);
+	IF diff == 1;
+		D = D[2:_tr,.];
+		Omt= Omt[2:_tr,2:_tr];
+		dc = ln(_c)-miss(shiftr(ln(_c)',1,-999),-999);
+		dcopt= ln(copt)-miss(shiftr(ln(copt)',1,-999),-999);
+		g = dc[2:_tr]-dcopt[2:_tr];
+	ENDIF;	
+	Ov = Itm/(1+taui)*g'*INVPD(Om)*g;
+  RETP(D,VV,Ov);
+ENDP; /* Var1b */
+
+PROC(4)= Var2(&fn,g1,g2i,ITm,par,taui,VM,diff);
+/* computes the Var-Cov matrix for second stage with correction for first stage
+** INPUTS:
+**	fn	: procedure for the moments evaluated at the estimated parameters
+**	g1	: gradient of moment at second stage parameters
+**	g2i	: gradient of moments with first stage parameters
+**	Itm	: average number of observations per age (data)
+**	par	: parameters
+**	taui	: inverse of number of profile per age (simulation)
+**	VM	: VCV matrix from second stage without correction
+**	diff	: estimation in levels or first difference.
+** OUTPUT:
+**	g2	: gradient of moments at first stage parameters
+**	VV	: VCV with correction for first stage
+**	INVPD(VMs): optimal weights for second round of estimation (GMM)
+**	Ov	: test of GMM overidentification restrictions
+** GLOBALS
+**	_om1	: inverse optimal weighting matrix, level
+**	_Om2	: inverse optimal weighting matrix, differences
+**	_W1	: optimal weighting matrix, level
+**	_W2	: optimal weighting matrix, difference
+**	_parm	: indicator for parameters
+**	_parm2	: same as _parm
+**	_parv	: indicator for first stage parameters
+**	_gdcd()	: numerical gradient procedure in Gauss
+*/
+  LOCAL F2,V1,Vin,Vout,k,g2,VV,pari,n,pars,Om,WW;
+  LOCAL fn:proc,VMs,Ov;
+	IF diff == 0;
+		Om = _Om1;
+		WW = _W1;
+	ELSEIF diff == 1;
+		Om = _Om2;
+		WW = _W2;
+	ENDIF;
+	n   = ROWS(_parm);
+	_parm2 = (1-_parm).*_parv;
+	pari= SEQA(1,1,n); /* selects the params not in first stage and in second stage */
+	pari= pari.*_parm2;
+	pari= DELIF(pari,pari.==0);
+	k   = ROWS(g1);
+	pars= SELIF(par,_parm2.==1);
+	IF g2i ==0 OR COLS(g2i)/=ROWS(pars);
+		g2 = _gdcd(&fn,pars,0); /* OPTMUM numerical gradient	*/
+	ELSE;
+		g2 = g2i;
+	ENDIF;
+	VMs = Om*(1+taui)+Itm*g2*VM[pari,pari]*g2';
+	IF _opw2 == 0;
+		Vin = g1'WW*VMs*WW'*g1/Itm;
+		Vout= INVPD(g1'WW*g1);
+		VV  = Vout*Vin*Vout';
+	ELSEIF _opw2 == 1;
+		VV = INVPD(g1'INVPD(VMs)*g1)/Itm;
+	ENDIF;
+	/* overidentification test */
+	Ov = Itm/(1+taui)*g1'*INVPD(Om)*g1;
+  RETP(g2,VV,INVPD(VMs),Ov);
+ENDP; /* Var */
+
+
+PROC(1)= SavTrac(btrac,r0trac,x0trac,gamtrac,ptrac,dtrac,drtrac,xmtrac,ctrac,tctrac,trac_f,trac_nf);
+/* saves the data buffer fro tracking */
+	IF _savt == 1;
+		trac_f = VPUT(trac_f,btrac,"btrac");
+		trac_f = VPUT(trac_f,r0trac,"r0trac");
+		trac_f = VPUT(trac_f,x0trac,"x0trac");
+		trac_f = VPUT(trac_f,gamtrac,"gamtrac");
+		trac_f = VPUT(trac_f,ptrac,"ptrac");
+		trac_f = VPUT(trac_f,dtrac,"dtrac");
+		trac_f = VPUT(trac_f,drtrac,"drtrac");
+		trac_f = VPUT(trac_f,xmtrac,"xmtrac");
+		trac_f = VPUT(trac_f,ctrac,"ctrac");
+		trac_f = VPUT(trac_f,tctrac,"tctrac");
+		SAVE path=^pathres ^trac_nf = trac_f;
+	ENDIF;
+  RETP(trac_f);
+ENDP;
+
+END;
